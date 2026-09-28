@@ -1,0 +1,173 @@
+name: SteelGiants APK Forensics
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'input/*.apk'
+      - 'tools/**'
+      - '.github/workflows/apk-forensics.yml'
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y unzip binutils file diffutils
+
+      - name: Prepare output
+        run: |
+          mkdir -p out
+
+      - name: Find APK files
+        run: |
+          echo "=== INPUT FILES ===" | tee out/INPUT.txt
+          find input -maxdepth 1 -type f -name '*.apk' -print 2>/dev/null | tee -a out/INPUT.txt || true
+
+      - name: Analyze APK files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          shopt -s nullglob
+          apks=(input/*.apk)
+
+          if [ ${#apks[@]} -eq 0 ]; then
+            echo "NO APK FILES FOUND" | tee out/STATUS.txt
+            exit 0
+          fi
+
+          for apk in "${apks[@]}"; do
+
+            base="$(basename "$apk" .apk)"
+            dst="out/$base"
+
+            mkdir -p "$dst/unpacked"
+
+            echo "======================================" | tee "$dst/report.txt"
+            echo "SteelGiants APK FORENSICS" | tee -a "$dst/report.txt"
+            echo "APK: $apk" | tee -a "$dst/report.txt"
+            echo "======================================" | tee -a "$dst/report.txt"
+
+            echo "" >> "$dst/report.txt"
+            echo "SHA256:" >> "$dst/report.txt"
+            sha256sum "$apk" | tee -a "$dst/report.txt"
+
+            echo "" >> "$dst/report.txt"
+            echo "FILE:" >> "$dst/report.txt"
+            file "$apk" | tee -a "$dst/report.txt"
+
+            echo "Testing APK ZIP..."
+            unzip -t "$apk" > "$dst/unzip-test.txt"
+
+            echo "Extracting APK..."
+            unzip -q "$apk" -d "$dst/unpacked"
+
+            echo "APK CONTENTS:" > "$dst/apk-files.txt"
+            find "$dst/unpacked" -type f | sort >> "$dst/apk-files.txt"
+
+            echo "ASSETS:" > "$dst/assets.txt"
+            find "$dst/unpacked/assets" -type f 2>/dev/null | sort >> "$dst/assets.txt" || true
+
+            echo "LIBMAIN:" > "$dst/libmain-paths.txt"
+            find "$dst/unpacked/lib" -type f -name 'libmain.so' 2>/dev/null | sort >> "$dst/libmain-paths.txt" || true
+
+            while IFS= read -r so; do
+
+              if [[ "$so" != *libmain.so ]]; then
+                continue
+              fi
+
+              abi="$(basename "$(dirname "$so")")"
+
+              mkdir -p "$dst/$abi"
+
+              echo "Analyzing $abi / libmain.so"
+
+              file "$so" > "$dst/$abi/file.txt"
+
+              sha256sum "$so" > "$dst/$abi/sha256.txt"
+
+              readelf -h "$so" > "$dst/$abi/readelf-header.txt" || true
+
+              readelf -Ws "$so" > "$dst/$abi/readelf-symbols.txt" || true
+
+              nm -C "$so" > "$dst/$abi/nm.txt" 2>&1 || true
+
+              strings -a -n 4 "$so" > "$dst/$abi/strings.txt" || true
+
+              grep -Ein \
+              'mob|radar|mini.?map|hostile|enemy|entity|move|create|remove|draw|world|g_mob_live|entprobe|prototype' \
+              "$dst/$abi/strings.txt" \
+              > "$dst/$abi/relevant-strings.txt" || true
+
+            done < "$dst/libmain-paths.txt"
+
+          done
+
+      - name: Compare APK versions
+        shell: bash
+        run: |
+          mapfile -t dirs < <(
+            find out -mindepth 1 -maxdepth 1 -type d -printf '%f\n' | sort
+          )
+
+          if [ ${#dirs[@]} -lt 2 ]; then
+            echo "Need at least two APKs for comparison." > out/COMPARE.txt
+            exit 0
+          fi
+
+          a="out/${dirs[0]}"
+          b="out/${dirs[1]}"
+
+          {
+            echo "STEELGIANTS APK COMPARISON"
+            echo "A=${dirs[0]}"
+            echo "B=${dirs[1]}"
+          } > out/COMPARE.txt
+
+          diff -u \
+            "$a/assets.txt" \
+            "$b/assets.txt" \
+            > out/assets.diff || true
+
+          for abi in armeabi-v7a arm64-v8a x86 x86_64; do
+
+            if [ -f "$a/$abi/relevant-strings.txt" ] &&
+               [ -f "$b/$abi/relevant-strings.txt" ]; then
+
+              diff -u \
+                "$a/$abi/relevant-strings.txt" \
+                "$b/$abi/relevant-strings.txt" \
+                > "out/relevant-strings-$abi.diff" || true
+            fi
+
+          done
+
+      - name: Create summary
+        run: |
+          {
+            echo "# SteelGiants APK Forensics"
+            echo
+            echo "## APK files"
+            find input -maxdepth 1 -name '*.apk' -type f -printf '%f\n' 2>/dev/null || true
+            echo
+            echo "## libmain.so"
+            find out -name libmain-paths.txt -exec cat {} \; 2>/dev/null || true
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload analysis artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SteelGiants-APK-Forensics
+          path: out/
+          retention-days: 14
